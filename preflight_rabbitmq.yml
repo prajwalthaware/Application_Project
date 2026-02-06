@@ -1,0 +1,221 @@
+---
+# RabbitMQ Preflight Connectivity and Resource Check Playbook
+# Validates infrastructure readiness before RabbitMQ cluster deployment
+# Run time: ~30 seconds | Non-destructive: Only reads system information
+
+- name: RabbitMQ Preflight - Connectivity and Resource Validation
+  hosts: all
+  gather_facts: yes
+  become: true
+  vars:
+    min_ram_mb: 2048
+    min_disk_gb: 10
+    required_ports:
+      - { port: 5672, name: "AMQP" }
+      - { port: 15672, name: "Management UI" }
+      - { port: 25672, name: "Erlang Distribution" }
+      - { port: 4369, name: "EPMD" }
+    preflight_status: "SUCCESS"
+    preflight_errors: []
+  
+  tasks:
+    # ===== CONNECTIVITY CHECK =====
+    - name: Test SSH Connectivity
+      ping:
+      register: ping_result
+      failed_when: false
+
+    - name: Record SSH Failure
+      set_fact:
+        preflight_status: "FAILED"
+        preflight_errors: "{{ preflight_errors + ['SSH connection test failed'] }}"
+      when: ping_result is failed
+
+    # ===== RAM CHECK =====
+    - name: Check Minimum RAM
+      set_fact:
+        preflight_status: "FAILED"
+        preflight_errors: "{{ preflight_errors + ['Insufficient RAM: ' + (ansible_memtotal_mb | string) + 'MB (minimum 2048MB required)'] }}"
+      when: 
+        - ansible_memtotal_mb < min_ram_mb
+        - ping_result is succeeded
+
+    # ===== DISK DISCOVERY =====
+    - name: Identify Root Disk Name
+      set_fact:
+        root_disk_name: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='device') | list | first | regex_replace('/dev/', '') | regex_replace('[0-9]+$', '') }}"
+      when: ping_result is succeeded
+
+    - name: Get list of mounted device base names
+      set_fact:
+        mounted_base_devices: "{{ ansible_mounts | map(attribute='device') | map('regex_replace', '/dev/', '') | map('regex_replace', '[0-9]+$', '') | unique | list }}"
+      when: ping_result is succeeded
+
+    - name: Find Candidate Data Disks (unmounted, no partitions, >5GB)
+      set_fact:
+        candidate_disks: "{{ candidate_disks | default([]) + [item] }}"
+      when:
+        - ping_result is succeeded
+        - item.key != root_disk_name
+        - not item.key.startswith(('loop', 'ram', 'sr', 'dm'))
+        - item.value.size | human_to_bytes > 5368709120
+        - item.value.partitions | length == 0
+        - item.key not in mounted_base_devices
+      loop: "{{ ansible_devices | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Calculate Total Available Disk Space
+      set_fact:
+        total_disk_gb: "{{ ((candidate_disks | default([]) | map(attribute='value.size') | map('human_to_bytes') | sum) / 1073741824) | round(2) }}"
+      when: 
+        - ping_result is succeeded
+        - candidate_disks is defined
+
+    - name: Set Disk Space to Zero if No Disks Found
+      set_fact:
+        total_disk_gb: 0
+      when: candidate_disks is not defined or candidate_disks | length == 0
+
+    - name: Check Minimum Disk Space
+      set_fact:
+        preflight_status: "FAILED"
+        preflight_errors: "{{ preflight_errors + ['Insufficient disk space: ' + (total_disk_gb | string) + 'GB available (minimum 10GB required)'] }}"
+      when: 
+        - ping_result is succeeded
+        - total_disk_gb | float < min_disk_gb
+
+    # ===== LVM DETECTION (Existing RabbitMQ VG) =====
+    - name: Check for Existing RabbitMQ Volume Group
+      shell: "vgs rabbitmq_vg --noheadings -o vg_size --units g 2>/dev/null"
+      register: existing_vg
+      ignore_errors: true
+      changed_when: false
+      when: ping_result is succeeded
+
+    - name: Check for Existing Logical Volumes
+      shell: "lvs rabbitmq_vg --noheadings -o lv_name,lv_size --units g 2>/dev/null"
+      register: existing_lvs
+      ignore_errors: true
+      changed_when: false
+      when: 
+        - ping_result is succeeded
+        - existing_vg.rc == 0
+
+    # ===== PORT AVAILABILITY CHECK =====
+    - name: Check if Required Ports are Available
+      wait_for:
+        port: "{{ item.port }}"
+        state: stopped
+        timeout: 2
+      loop: "{{ required_ports }}"
+      register: port_check
+      ignore_errors: true
+      when: ping_result is succeeded
+
+    - name: Record Port Conflicts
+      set_fact:
+        preflight_errors: "{{ preflight_errors + ['Port ' + (item.item.port | string) + ' (' + item.item.name + ') is already in use'] }}"
+        preflight_status: "FAILED"
+      when: 
+        - ping_result is succeeded
+        - item.failed is defined and item.failed
+      loop: "{{ port_check.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('unknown') }}"
+
+    # ===== EXISTING RABBITMQ CHECK =====
+    - name: Check for Existing RabbitMQ Installation
+      shell: "which rabbitmqctl 2>/dev/null"
+      register: existing_rmq
+      ignore_errors: true
+      changed_when: false
+      when: ping_result is succeeded
+
+    - name: Check RabbitMQ Service Status
+      shell: "systemctl is-active rabbitmq-server 2>/dev/null || echo 'inactive'"
+      register: rmq_service_status
+      ignore_errors: true
+      changed_when: false
+      when: 
+        - ping_result is succeeded
+        - existing_rmq.rc == 0
+
+    # ===== BUILD PREFLIGHT REPORT =====
+    - name: Build Node Info
+      set_fact:
+        node_info:
+          hostname: "{{ ansible_hostname }}"
+          ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
+          ram_mb: "{{ ansible_memtotal_mb }}"
+          disk_available_gb: "{{ total_disk_gb | default(0) }}"
+          candidate_disks: "{{ candidate_disks | default([]) | map(attribute='key') | list }}"
+          existing_rabbitmq_vg: "{{ existing_vg.rc == 0 if existing_vg is defined else false }}"
+          existing_rabbitmq_vg_size: "{{ existing_vg.stdout | trim if (existing_vg is defined and existing_vg.rc == 0) else 'N/A' }}"
+          existing_lvs: "{{ existing_lvs.stdout_lines | default([]) }}"
+          rabbitmq_installed: "{{ existing_rmq.rc == 0 if existing_rmq is defined else false }}"
+          rabbitmq_running: "{{ rmq_service_status.stdout | default('unknown') == 'active' }}"
+          status: "{{ preflight_status }}"
+          errors: "{{ preflight_errors }}"
+          force_wipe_required: "{{ existing_vg.rc == 0 if existing_vg is defined else false }}"
+      when: ping_result is succeeded
+
+    - name: Build Failed Node Info
+      set_fact:
+        node_info:
+          hostname: "{{ inventory_hostname }}"
+          ip: "{{ inventory_hostname }}"
+          status: "FAILED"
+          errors: ["SSH connection failed - node unreachable"]
+          force_wipe_required: false
+      when: ping_result is failed
+
+    - name: Display Preflight Result
+      debug:
+        msg: |
+          ══════════════════════════════════════════════
+          NODE: {{ node_info.hostname }} ({{ node_info.ip }})
+          ══════════════════════════════════════════════
+          STATUS: {{ node_info.status }}
+          RAM: {{ node_info.ram_mb | default('N/A') }} MB
+          Available Disk: {{ node_info.disk_available_gb | default('N/A') }} GB
+          Candidate Disks: {{ node_info.candidate_disks | default([]) | join(', ') or 'None' }}
+          Existing rabbitmq_vg: {{ node_info.existing_rabbitmq_vg | default(false) }}
+          RabbitMQ Installed: {{ node_info.rabbitmq_installed | default(false) }}
+          RabbitMQ Running: {{ node_info.rabbitmq_running | default(false) }}
+          Force Wipe Required: {{ node_info.force_wipe_required }}
+          {% if node_info.errors | length > 0 %}
+          ERRORS:
+          {% for err in node_info.errors %}
+            - {{ err }}
+          {% endfor %}
+          {% endif %}
+          ══════════════════════════════════════════════
+
+# ===== AGGREGATE RESULTS FOR WEBHOOK =====
+- name: Aggregate Preflight Results
+  hosts: localhost
+  gather_facts: false
+  
+  tasks:
+    - name: Collect All Node Results
+      set_fact:
+        all_nodes_results: "{{ groups['rabbitmq_nodes'] | map('extract', hostvars, 'node_info') | list }}"
+
+    - name: Determine Overall Status
+      set_fact:
+        overall_status: "{{ 'FAILED' if (all_nodes_results | selectattr('status', 'equalto', 'FAILED') | list | length > 0) else 'SUCCESS' }}"
+        any_force_wipe: "{{ all_nodes_results | selectattr('force_wipe_required', 'equalto', true) | list | length > 0 }}"
+        min_disk_available: "{{ all_nodes_results | map(attribute='disk_available_gb') | map('float') | min }}"
+
+    - name: Display Overall Summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║           RABBITMQ PREFLIGHT SUMMARY                         ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  Overall Status: {{ overall_status }}
+          ║  Nodes Checked: {{ all_nodes_results | length }}
+          ║  Force Wipe Required: {{ any_force_wipe }}
+          ║  Minimum Disk Available: {{ min_disk_available }} GB
+          ╚══════════════════════════════════════════════════════════════╝

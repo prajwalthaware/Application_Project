@@ -1,0 +1,84 @@
+---
+# RabbitMQ Disk Setup Task
+# Creates LVM volumes for RabbitMQ data and logs
+# Similar to Galera's disk_setup.yml but simplified for RabbitMQ
+
+- name: Install LVM2 dependencies
+  apt:
+    name: lvm2
+    state: present
+    update_cache: yes
+
+- block:
+    - name: Display Target Disks
+      debug:
+        msg: "Configuring LVM on: {{ target_disks }}"
+
+    - name: Ensure Volume Group 'rabbitmq_vg' exists
+      community.general.lvg:
+        vg: rabbitmq_vg
+        pvs: "{{ target_disks | join(',') }}"
+        state: present
+        force: yes
+
+    - name: Ensure Logical Volumes exist
+      community.general.lvol:
+        vg: rabbitmq_vg
+        lv: "{{ item.name }}"
+        size: "{{ item.size }}"
+      loop:
+        - { name: 'lv_logs', size: '{{ lv_logs_size | default("2g") }}' }
+
+    - name: Check if lv_data exists
+      shell: "lvs rabbitmq_vg/lv_data"
+      register: lv_data_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Ensure Data Volume exists (uses remaining space)
+      community.general.lvol:
+        vg: rabbitmq_vg
+        lv: lv_data
+        size: "{{ lv_data_size | default('100%FREE') }}"
+      when: lv_data_check.rc != 0
+
+    - name: Ensure Filesystems are formatted (XFS)
+      community.general.filesystem:
+        fstype: xfs
+        dev: "/dev/rabbitmq_vg/{{ item }}"
+      loop:
+        - lv_logs
+        - lv_data
+
+    - name: Ensure Mount Points exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: rabbitmq
+        group: rabbitmq
+      loop:
+        - /var/log/rabbitmq
+        - /var/lib/rabbitmq
+
+    - name: Ensure Logical Volumes are Mounted
+      mount:
+        path: "{{ item.path }}"
+        src: "/dev/rabbitmq_vg/{{ item.lv }}"
+        fstype: xfs
+        opts: noatime,nodiratime
+        state: mounted
+      loop:
+        - { path: '/var/log/rabbitmq', lv: 'lv_logs' }
+        - { path: '/var/lib/rabbitmq', lv: 'lv_data' }
+
+    - name: Set Ownership on Mounted Directories
+      file:
+        path: "{{ item }}"
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0755'
+        state: directory
+      loop:
+        - /var/log/rabbitmq
+        - /var/lib/rabbitmq
